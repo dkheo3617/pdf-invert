@@ -13,11 +13,11 @@ PDF의 모든 페이지를 색 반전(흰 바탕 ↔ 검은 바탕)해 원본 �
 - 맥: Dock 아이콘에 PDF 떨어뜨리기 / 윈도우: 오른쪽 클릭 메뉴·보내기 메뉴
 
 ## 설치파일 받기
-GitHub의 **Releases** 또는 **Actions → 최근 빌드 → Artifacts**에서
-- 맥: `PDFInvert-2.0.0-mac.dmg` (Apple Silicon)
-- 윈도우: `PDFInvert-2.0.0-Windows-Setup.exe`
+- 맥 (Apple 칩 M1 이상): https://github.com/dkheo3617/pdf-invert/releases/latest/download/PDFInvert-mac.dmg
+- 윈도우 10/11: https://github.com/dkheo3617/pdf-invert/releases/latest/download/PDFInvert-Windows-Setup.exe
 
-새 버전 배포: `git tag v2.0.1 && git push --tags` → 자동으로 Release 생성.
+main에 올리면 자동으로 빌드되어 Release(v + src/app.py의 VERSION)가 갱신됩니다.
+새 버전을 낼 때는 src/app.py, pdf_invert.spec, installer/windows.iss의 버전을 함께 올리세요.
 
 ## 직접 실행 (개발용)
 ```bash
