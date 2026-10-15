@@ -1,0 +1,63 @@
+name: 설치파일 빌드
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-14   # Apple Silicon (M1~)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: 앱 빌드
+        run: pyinstaller --noconfirm pdf_invert.spec
+      - name: DMG 만들기
+        run: |
+          mkdir -p dmg
+          cp -R "dist/PDF색상반전.app" dmg/
+          ln -s /Applications dmg/Applications
+          cp "installer/처음 실행 전 읽어주세요.txt" dmg/
+          hdiutil create -volname "PDF색상반전" -srcfolder dmg -ov -format UDZO dist/PDFInvert-2.0.0-mac.dmg
+      - uses: actions/upload-artifact@v4
+        with: { name: mac, path: dist/PDFInvert-2.0.0-mac.dmg }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: 앱 빌드
+        run: pyinstaller --noconfirm pdf_invert.spec
+      - name: Inno Setup 준비
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          $official = "C:\Program Files (x86)\Inno Setup 6\Languages\Korean.isl"
+          if (Test-Path $official) { Copy-Item $official installer\Korean.isl }
+          else { Invoke-WebRequest "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/Korean.isl" -OutFile installer\Korean.isl }
+      - name: 설치파일 만들기
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\windows.iss'
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/PDFInvert-2.0.0-Windows-Setup.exe }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
