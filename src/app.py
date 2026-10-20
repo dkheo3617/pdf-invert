@@ -6,18 +6,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton,
+    QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QProgressDialog, QPushButton,
     QVBoxLayout, QWidget,
 )
 
+import updater
 from inverter import QUALITY_PRESETS, Job, collect_jobs, invert_pdf, page_count
 
 APP_NAME = "PDF 색상반전"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 def resource(name: str) -> str:
@@ -66,6 +67,52 @@ class Worker(QObject):
             done = base + totals[idx]
             self.progress.emit(done, total)
         self.finished.emit(ok, fail)
+
+
+class Task(QObject):
+    """함수 하나를 백그라운드 스레드에서 실행 (업데이트 확인·다운로드용)."""
+    done = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn, self.stop_flag = fn, False
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(self))
+        except InterruptedError:
+            self.failed.emit("취소됨")
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e) or e.__class__.__name__)
+
+
+class _Relay(QObject):
+    """작업 스레드의 신호를 메인(UI) 스레드로 넘겨 주는 중계 객체."""
+    done = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int)
+
+
+def run_task(owner, fn, on_done, on_fail, on_progress=None) -> Task:
+    th = QThread()
+    t = Task(fn)
+    relay = _Relay()  # 메인 스레드에서 생성 → 콜백이 UI 스레드에서 실행됨
+    t.moveToThread(th)
+    th.started.connect(t.run)
+    t.done.connect(relay.done, Qt.QueuedConnection)
+    t.failed.connect(relay.failed, Qt.QueuedConnection)
+    t.progress.connect(relay.progress, Qt.QueuedConnection)
+    relay.done.connect(on_done)
+    relay.failed.connect(on_fail)
+    if on_progress:
+        relay.progress.connect(on_progress)
+    for sig in (t.done, t.failed):
+        sig.connect(th.quit)
+    owner._tasks = [x for x in getattr(owner, "_tasks", []) if x[0].isRunning()] + [(th, t, relay)]
+    th.start()
+    return t
 
 
 class DropZone(QFrame):
@@ -122,6 +169,7 @@ QWidget { font-size: 13px; }
 #dropTitle { font-size: 15px; font-weight: 600; }
 #dropSub { color: #888; font-size: 12px; }
 QPushButton { padding: 6px 14px; }
+#upd { padding: 2px 8px; font-size: 12px; }
 QProgressBar { height: 16px; border-radius: 6px; text-align: center; }
 """
 
@@ -144,7 +192,11 @@ class MainWindow(QWidget):
         head = QHBoxLayout()
         title = QLabel(APP_NAME); title.setObjectName("title")
         ver = QLabel(f"v{VERSION}"); ver.setObjectName("ver")
+        self.btn_update = QPushButton("업데이트 확인"); self.btn_update.setObjectName("upd")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.clicked.connect(lambda: self.check_update(silent=False))
         head.addWidget(title); head.addStretch(); head.addWidget(ver, alignment=Qt.AlignBottom)
+        head.addWidget(self.btn_update, alignment=Qt.AlignBottom)
         root.addLayout(head)
 
         self.drop = DropZone()
@@ -186,6 +238,99 @@ class MainWindow(QWidget):
         self.btn_cancel.clicked.connect(self.cancel)
         bottom.addWidget(self.btn_open); bottom.addStretch(); bottom.addWidget(self.btn_cancel)
         root.addLayout(bottom)
+
+        QTimer.singleShot(1500, lambda: self.check_update(silent=True))
+
+    # ── 업데이트 ──────────────────────────────────────
+    def check_update(self, silent: bool):
+        if getattr(self, "_checking", False):
+            return
+        self._checking = True
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("확인 중…")
+
+        def finish():
+            self._checking = False
+            self.btn_update.setEnabled(True)
+            self.btn_update.setText("업데이트 확인")
+
+        def ok(rel):
+            finish()
+            if not updater.is_newer(rel.version, VERSION):
+                if not silent:
+                    QMessageBox.information(self, APP_NAME, f"최신 버전(v{VERSION})을 사용하고 있습니다.")
+                return
+            if silent and self.settings.value("skip_version", "") == rel.version:
+                return
+            if self.busy():  # 변환이 끝난 뒤 다시 알림
+                QTimer.singleShot(5000, lambda: self.check_update(silent))
+                return
+            self.offer_update(rel, silent)
+
+        def fail(msg):
+            finish()
+            if not silent:
+                QMessageBox.warning(self, APP_NAME, f"업데이트 정보를 가져오지 못했습니다.\n인터넷 연결을 확인해 주세요.\n\n({msg})")
+
+        run_task(self, lambda t: updater.fetch_latest(), ok, fail)
+
+    def offer_update(self, rel, silent: bool):
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"새 버전 v{rel.version}이 나왔습니다. (현재 v{VERSION})")
+        notes = rel.notes.strip()
+        box.setInformativeText((notes[:600] + "\n\n" if notes else "") + "지금 업데이트할까요? 설치 후 앱이 다시 열립니다.")
+        b_yes = box.addButton("지금 업데이트", QMessageBox.AcceptRole)
+        b_later = box.addButton("나중에", QMessageBox.RejectRole)
+        b_skip = box.addButton("이 버전 건너뛰기", QMessageBox.DestructiveRole) if silent else None
+        box.setEscapeButton(b_later)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is None:
+            return
+        if b_skip is not None and clicked is b_skip:
+            self.settings.setValue("skip_version", rel.version)
+        elif clicked is b_yes:
+            self.download_update(rel)
+
+    def download_update(self, rel):
+        if not getattr(sys, "frozen", False) or not rel.asset_url:
+            QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
+            return
+        dlg = QProgressDialog("새 버전을 내려받는 중…", "취소", 0, 100, self)
+        dlg.setWindowTitle(APP_NAME); dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0); dlg.setValue(0)
+
+        def work(task):
+            return updater.download(rel, on_progress=lambda d, t: task.progress.emit(d, t),
+                                    should_stop=lambda: task.stop_flag)
+
+        def prog(done, total):
+            if total:
+                dlg.setValue(int(done * 100 / total))
+                dlg.setLabelText(f"새 버전을 내려받는 중… {done / 1e6:.0f} / {total / 1e6:.0f}MB")
+
+        def ok(path):
+            dlg.close()
+            try:
+                how = updater.install_and_restart(path)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(self, APP_NAME, f"설치를 시작하지 못했습니다.\n({e})")
+                return
+            if how == "quit":
+                QApplication.quit()
+            else:
+                QMessageBox.information(self, APP_NAME, "설치파일을 열었습니다.\n"
+                                        "앱 아이콘을 Applications 폴더로 끌어다 놓아 바꿔 주세요.")
+
+        def fail(msg):
+            dlg.close()
+            if msg != "취소됨":
+                QMessageBox.warning(self, APP_NAME, f"내려받기에 실패했습니다.\n({msg})")
+
+        task = run_task(self, work, ok, fail, prog)
+        dlg.canceled.connect(lambda: setattr(task, "stop_flag", True))
 
     # ── 입력 ──────────────────────────────────────────
     def _start_dir(self) -> str:

@@ -69,7 +69,5 @@ jobs:
           name: PDF 색상반전 v${{ steps.ver.outputs.v }}
           make_latest: true
           overwrite_files: true
-          body: |
-            - 맥 (Apple 칩 M1 이상): PDFInvert-mac.dmg
-            - 윈도우 10/11: PDFInvert-Windows-Setup.exe
+          body_path: RELEASE_NOTES.md
           files: out/*

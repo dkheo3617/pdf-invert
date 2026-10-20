@@ -1,9 +1,11 @@
 ﻿; Inno Setup 설치 스크립트 (Windows)
 #define AppName "PDF 색상반전"
-#define AppVersion "2.1.0"
+#define AppVersion "2.2.0"
 #define AppExe "PDFInvert.exe"
 
 [Setup]
+CloseApplications=force
+RestartApplications=no
 AppId={{6F2B1E57-3C2A-4C1B-9D51-7A1F0B4E2D10}
 AppName={#AppName}
 AppVersion={#AppVersion}
@@ -44,3 +46,5 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.pdf\shell\PDFInver
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "지금 실행"; Flags: nowait postinstall skipifsilent
+; 앱 안에서 자동 업데이트(무인 설치)한 경우 설치 후 바로 다시 실행
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
