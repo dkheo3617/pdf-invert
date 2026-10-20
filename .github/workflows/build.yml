@@ -19,6 +19,8 @@ jobs:
       - run: pip install -r requirements.txt
       - name: 앱 빌드
         run: pyinstaller --noconfirm pdf_invert.spec
+      - name: 실행 확인 (selftest)
+        run: '"dist/PDF색상반전.app/Contents/MacOS/PDFInvert" --selftest'
       - name: DMG 만들기
         run: |
           mkdir -p dmg
@@ -38,6 +40,11 @@ jobs:
       - run: pip install -r requirements.txt
       - name: 앱 빌드
         run: pyinstaller --noconfirm pdf_invert.spec
+      - name: 실행 확인 (selftest)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\PDFInvert\PDFInvert.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "selftest failed: $($p.ExitCode)" }
       - name: Inno Setup 준비
         shell: pwsh
         run: |

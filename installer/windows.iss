@@ -1,6 +1,6 @@
 ﻿; Inno Setup 설치 스크립트 (Windows)
 #define AppName "PDF 색상반전"
-#define AppVersion "2.2.0"
+#define AppVersion "2.2.1"
 #define AppExe "PDFInvert.exe"
 
 [Setup]
