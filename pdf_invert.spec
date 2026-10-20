@@ -15,7 +15,7 @@ a = Analysis(
     pathex=["src"],
     datas=[("assets/icon.png", "assets")] + mu_datas,
     binaries=mu_bins,
-    hiddenimports=mu_hidden + ["app", "updater", "inverter", "recolor", "pikepdf"],
+    hiddenimports=mu_hidden + ["app", "updater", "inverter", "recolor"],
     excludes=["tkinter", "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick",
               "PySide6.QtWebEngineCore", "PySide6.QtMultimedia", "PySide6.QtPdf"],
 )

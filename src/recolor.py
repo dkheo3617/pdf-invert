@@ -1,76 +1,29 @@
-"""PDF 안의 색 지정값을 직접 뒤집는 '빠른 변환' (v2.3).
+"""PDF 안의 색 지정값을 직접 뒤집는 '빠른 변환' (PyMuPDF만 사용).
 
-혼합 모드(Difference) 층을 덮는 대신, 글자·선·면의 색 명령과 이미지 자체를 반전하고
+혼합 모드 층을 덮는 대신 글자·선·면의 색 명령, 이미지, 팔레트, 그라데이션을 직접 반전하고
 검은 바탕을 깐다. 어떤 보기 앱에서도 똑같이 보이며 글자는 벡터 그대로 남는다.
 """
 from __future__ import annotations
 
-import io
 import re
-from decimal import Decimal
 
-import pikepdf
-from pikepdf import Name, Array, Dictionary, Stream
+import pymupdf
 
-NUM = (int, float, Decimal)
+# ── 값 계산 ──────────────────────────────────────────────
 
 
-def _n(x) -> float:
-    return float(x)
-
-
-def _r(x: float):
-    x = 0.0 if x < 0 else 1.0 if x > 1 else x
-    return Decimal(f"{x:.4f}").normalize() if x not in (0.0, 1.0) else int(x)
+def _clip(x: float) -> float:
+    return 0.0 if x < 0 else 1.0 if x > 1 else x
 
 
 def _inv_list(vals):
-    return [_r(1 - _n(v)) for v in vals]
+    return [_clip(1 - float(v)) for v in vals]
 
 
 def _inv_cmyk(c, m, y, k):
-    # 보이는 색(RGB) 기준으로 뒤집은 뒤 다시 CMYK(k=0)로
-    c, m, y, k = map(_n, (c, m, y, k))
-    return [_r((1 - c) * (1 - k)), _r((1 - m) * (1 - k)), _r((1 - y) * (1 - k)), 0]
-
-
-# ── 색 공간 판별 ─────────────────────────────────────────
-def _family(cs, resources) -> tuple[str, int]:
-    """색 공간 → (종류, 성분 수). 종류: gray rgb cmyk tint idx pattern other"""
-    try:
-        if isinstance(cs, Name):
-            s = str(cs)
-            if s in ("/DeviceGray", "/G", "/CalGray"):
-                return "gray", 1
-            if s in ("/DeviceRGB", "/RGB", "/CalRGB"):
-                return "rgb", 3
-            if s in ("/DeviceCMYK", "/CMYK"):
-                return "cmyk", 4
-            if s == "/Pattern":
-                return "pattern", 0
-            if s in ("/Indexed", "/I"):
-                return "idx", 1
-            if resources is not None and "/ColorSpace" in resources and s in resources.ColorSpace:
-                return _family(resources.ColorSpace[s], None)
-            return "other", 0
-        if isinstance(cs, Array) and len(cs):
-            fam = str(cs[0])
-            if fam == "/ICCBased":
-                n = int(cs[1].get("/N", 3))
-                return {1: ("gray", 1), 3: ("rgb", 3), 4: ("cmyk", 4)}.get(n, ("other", n))
-            if fam == "/CalRGB":
-                return "rgb", 3
-            if fam == "/CalGray":
-                return "gray", 1
-            if fam in ("/Separation", "/DeviceN"):
-                return "tint", (1 if fam == "/Separation" else len(cs[1]))
-            if fam in ("/Indexed", "/I"):
-                return "idx", 1
-            if fam == "/Pattern":
-                return "pattern", 0
-    except Exception:
-        pass
-    return "other", 0
+    # 보이는 색(RGB) 기준으로 뒤집은 뒤 k=0 인 CMYK로 표현
+    c, m, y, k = (float(v) for v in (c, m, y, k))
+    return [_clip((1 - c) * (1 - k)), _clip((1 - m) * (1 - k)), _clip((1 - y) * (1 - k)), 0.0]
 
 
 def _invert_color_values(fam, vals):
@@ -81,46 +34,175 @@ def _invert_color_values(fam, vals):
     return None
 
 
+def _fmt(v) -> bytes:
+    v = float(v)
+    if v <= 0:
+        return b"0"
+    if v >= 1:
+        return b"1"
+    return (f"{v:.4f}".rstrip("0").rstrip(".") or "0").encode()
+
+
+# ── PDF 객체 문자열 다루기 ───────────────────────────────
+
+
+def _top_keys(text: str) -> list[str]:
+    """'<< /A 1 0 R /B << ... >> >>' 의 맨 바깥 키 이름들."""
+    keys, depth, i, n = [], 0, 0, len(text)
+    expect_key = False
+    while i < n:
+        c = text[i]
+        if text.startswith("<<", i):
+            depth += 1
+            i += 2
+            if depth == 1:
+                expect_key = True
+            continue
+        if text.startswith(">>", i):
+            depth -= 1
+            i += 2
+            if depth == 1:
+                expect_key = True
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 1:
+                expect_key = True
+        elif c == "(":
+            lvl = 1
+            i += 1
+            while i < n and lvl:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                lvl += {"(": 1, ")": -1}.get(text[i], 0)
+                i += 1
+            if depth == 1:
+                expect_key = True
+            continue
+        elif c == "/" and depth == 1:
+            m = re.match(r"/([^\s/<>\[\]()]+)", text[i:])
+            i += m.end()
+            if expect_key:
+                keys.append(m.group(1))
+                expect_key = False
+            else:
+                expect_key = True
+            continue
+        elif depth == 1 and not c.isspace() and not expect_key:
+            m = re.match(r"[^\s/<>\[\]()]+(?:\s+\d+\s+R)?", text[i:])
+            if m:
+                i += m.end()
+                expect_key = True
+                continue
+        i += 1
+    return keys
+
+
+class Ref:
+    """PDF 안 값의 위치: (xref, 키 경로). 간접 객체면 경로가 비어 있다."""
+    __slots__ = ("doc", "xref", "path")
+
+    def __init__(self, doc, xref, path=""):
+        self.doc, self.xref, self.path = doc, xref, path
+
+    def _k(self, key):
+        return f"{self.path}/{key}" if self.path else key
+
+    def get(self, key):
+        return self.doc.xref_get_key(self.xref, self._k(key))
+
+    def child(self, key):
+        t, v = self.get(key)
+        if t == "xref":
+            return Ref(self.doc, int(v.split()[0]))
+        if t in ("dict", "array"):
+            return Ref(self.doc, self.xref, self._k(key))
+        return None
+
+    def set(self, key, value: str):
+        self.doc.xref_set_key(self.xref, self._k(key), value)
+
+    def text(self):
+        if self.path:
+            return self.doc.xref_get_key(self.xref, self.path)[1]
+        return self.doc.xref_object(self.xref, compressed=True)
+
+    def keys(self):
+        if not self.path:
+            return list(self.doc.xref_get_keys(self.xref))
+        return _top_keys(self.text())
+
+    @property
+    def ident(self):
+        return (self.xref, self.path)
+
+
+# ── 색 공간 판별 ─────────────────────────────────────────
+_CS_TABLE = {"DeviceGray": ("gray", 1), "G": ("gray", 1), "CalGray": ("gray", 1),
+             "DeviceRGB": ("rgb", 3), "RGB": ("rgb", 3), "CalRGB": ("rgb", 3),
+             "DeviceCMYK": ("cmyk", 4), "CMYK": ("cmyk", 4),
+             "Pattern": ("pattern", 0), "Indexed": ("idx", 1), "I": ("idx", 1),
+             "Separation": ("tint", 1)}
+
+
+def _family_text(t: str, v: str, doc) -> tuple[str, int]:
+    """xref_get_key 결과(종류, 값) 또는 객체 문자열로 색 공간 종류를 판단."""
+    if t == "xref":
+        return _family_text("obj", doc.xref_object(int(v.split()[0]), compressed=True), doc)
+    s = (v or "").strip()
+    m = re.match(r"\[?\s*/([A-Za-z0-9]+)", s)
+    if not m:
+        return ("other", 0)
+    name = m.group(1)
+    if name == "ICCBased":
+        r = re.search(r"(\d+)\s+0\s+R", s)
+        n = 3
+        if r:
+            nm = re.search(r"/N\s+(\d+)", doc.xref_object(int(r.group(1)), compressed=True))
+            n = int(nm.group(1)) if nm else 3
+        return {1: ("gray", 1), 3: ("rgb", 3), 4: ("cmyk", 4)}.get(n, ("other", n))
+    if name == "DeviceN":
+        r = re.search(r"/DeviceN\s*\[([^\]]*)\]", s)
+        return ("tint", max(1, len(re.findall(r"/", r.group(1)))) if r else 1)
+    return _CS_TABLE.get(name, ("other", 0))
+
+
 class Recolor:
-    def __init__(self, pdf: pikepdf.Pdf):
-        self.pdf = pdf
-        self.done: set = set()  # 이미 처리한 객체(공유 자원 중복 방지)
-
-    def _once(self, obj) -> bool:
-        try:
-            key = obj.objgen
-        except Exception:
-            return True
-        if key == (0, 0):
-            return True
-        if key in self.done:
-            return False
-        self.done.add(key)
-        return True
-
-    # ── 내용 스트림 (바이트 단위 고속 처리) ─────────────────
-    # 1단계: 후보 위치만 아주 빠르게 찾고(단순 대안), 2단계: 파이썬에서 앞뒤 글자를 확인
     _CAND = re.compile(rb"\(|<|%|BI|scn|SCN|sc|SC|rg|RG|k|K|g|G|/|q|Q")
     _NAMEOP = re.compile(rb"/[^\s/\[\]()<>{}%]+\s*(cs|CS|Do|sh|scn|SCN)(?=[\s\[\]()<>{}/%]|\Z)")
+    _BACKNUMS = re.compile(rb"(?:(?<=[\s\[\]()<>])|^)((?:[-+]?(?:\d+\.?\d*|\.\d+)\s+){1,8})$")
+    _NUM = re.compile(rb"[-+]?(?:\d+\.?\d*|\.\d+)")
+    _STR = re.compile(rb"[()\\]")
     _ID = re.compile(rb"\sID\s")
     _EI = re.compile(rb"\sEI(?=\s|\Z)")
     _DELIM = frozenset(b" \t\r\n\f\x00[]()<>{}/%")
     _WS = frozenset(b" \t\r\n\f\x00")
     _QPRE = frozenset(b" \t\r\n\f\x00])>")
-    _BACKNUMS = re.compile(rb"(?:(?<=[\s\[\]()<>])|^)((?:[-+]?(?:\d+\.?\d*|\.\d+)\s+){1,8})$")
-    _STR = re.compile(rb"[()\\]")
-    _NUM = re.compile(rb"[-+]?(?:\d+\.?\d*|\.\d+)")
 
-    @staticmethod
-    def _fmt(v) -> bytes:
-        v = float(v)
-        if v <= 0:
-            return b"0"
-        if v >= 1:
-            return b"1"
-        return (f"{v:.4f}".rstrip("0").rstrip(".") or "0").encode()
+    def __init__(self, doc: pymupdf.Document):
+        self.doc = doc
+        self.done: set = set()
 
-    def transform_bytes(self, data: bytes, resources) -> bytes:
+    def _once(self, key) -> bool:
+        if key in self.done:
+            return False
+        self.done.add(key)
+        return True
+
+    def _family(self, name: str, res: Ref | None):
+        builtin = _family_text("name", name, self.doc)
+        if builtin[0] != "other" or res is None:
+            return builtin
+        t, v = res.get(f"ColorSpace/{name.lstrip('/')}")
+        if t == "null":
+            return ("other", 0)
+        return _family_text(t, v, self.doc)
+
+    # ── 내용 스트림 (바이트 단위 고속 처리) ─────────────
+    def transform_bytes(self, data: bytes, res: Ref | None) -> bytes:
         out = []
         pos = last = 0
         fill = stroke = ("gray", 1)
@@ -136,38 +218,8 @@ class Recolor:
             st, en = m.start(), m.end()
             nxt_ok = en >= n or data[en] in DELIM
             prev = data[st - 1] if st > 0 else 0x20
-            if t == b"(":
-                g = "str"
-            elif t == b"<":
-                if en < n and data[en] == 0x3C:  # '<<' 사전
-                    pos = en + 1
-                    continue
-                g = "hex"
-            elif t == b"%":
-                g = "cmt"
-            elif t == b"/":
-                m = NAMEOP.match(data, st)
-                if not m:
-                    pos = en
-                    continue
-                g = "nop"
-            elif t == b"BI":
-                if prev not in WS or not (en < n and data[en] in WS or data[en:en + 1] == b"/"):
-                    pos = en
-                    continue
-                g = "bi"
-            elif t in (b"q", b"Q"):
-                if not nxt_ok or prev not in QPRE:
-                    pos = en
-                    continue
-                g = "qq"
-            else:
-                if not nxt_ok or prev not in WS:
-                    pos = en
-                    continue
-                g = "cop"
-            if g == "str":  # 문자열은 괄호 짝을 맞춰 건너뜀
-                depth, k = 1, m.end()
+            if t == b"(":  # 문자열: 괄호 짝을 맞춰 건너뜀
+                depth, k = 1, en
                 while depth and k < n:
                     s2 = STR.search(data, k)
                     if not s2:
@@ -181,271 +233,372 @@ class Recolor:
                     k = s2.end()
                 pos = k
                 continue
-            if g == "hex":
-                e = data.find(b">", m.end())
+            if t == b"<":
+                if en < n and data[en] == 0x3C:  # '<<' 사전
+                    pos = en + 1
+                    continue
+                e = data.find(b">", en)
                 pos = n if e < 0 else e + 1
                 continue
-            if g == "cmt":
-                e = data.find(b"\n", m.end())
+            if t == b"%":
+                e = data.find(b"\n", en)
                 pos = n if e < 0 else e + 1
                 continue
-            if g == "bi":
+            if t == b"BI":
+                if prev not in WS or not (en < n and (data[en] in WS or data[en] == 0x2F)):
+                    pos = en
+                    continue
                 idp = self._ID.search(data, en)
                 if not idp:
                     pos = n
                     continue
-                head = data[en:idp.start()]
-                newhead = self._inline_head(head)
+                newhead = self._inline_head(data[en:idp.start()])
                 ei = self._EI.search(data, idp.end())
-                end = n if not ei else ei.end()
                 if newhead is not None:
-                    out.append(data[last:en]); out.append(newhead)
+                    out.append(data[last:en])
+                    out.append(newhead)
                     last = idp.start()
-                pos = end
+                pos = n if not ei else ei.end()
                 continue
-            if g == "qq":
-                if t == b"q":
-                    stack.append((fill, stroke))
-                elif stack:
-                    fill, stroke = stack.pop()
-                pos = m.end()
+            if t in (b"q", b"Q"):
+                if nxt_ok and prev in QPRE:
+                    if t == b"q":
+                        stack.append((fill, stroke))
+                    elif stack:
+                        fill, stroke = stack.pop()
+                pos = en
                 continue
-            if g == "cop":
-                op = t.decode()
-                ws = max(last, m.start() - 160)
-                bm = self._BACKNUMS.search(data, ws, m.start())
-                nums = self._NUM.findall(bm.group(1)) if bm else []
-                need = {"g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4}.get(op)
-                if need is None:  # sc/scn: 현재 색 공간 기준
-                    fam = fill if op in ("sc", "scn") else stroke
-                    need = fam[1] if fam[1] else len(nums)
-                    fam_name = fam[0]
-                else:
-                    fam_name = {1: "gray", 3: "rgb", 4: "cmyk"}[need]
-                    if op.islower():
-                        fill = (fam_name, need)
-                    else:
-                        stroke = (fam_name, need)
-                if bm and need and len(nums) >= need:
-                    keep, vals = nums[:-need], nums[-need:]
-                    new = _invert_color_values(fam_name, vals)
-                    if new is not None:
-                        out.append(data[last:bm.start(1)])
-                        out.append(b" ".join(keep + [self._fmt(v) for v in new]) + b" " + t)
-                        last = m.end()
-                pos = m.end()
-                continue
-            if g == "nop":
-                op = m.group(1)
-                nm = data[st:m.start(1)].strip().decode("latin1")
+            if t == b"/":
+                mm = NAMEOP.match(data, st)
+                if not mm:
+                    pos = en
+                    continue
+                op = mm.group(1)
+                nm = data[st:mm.start(1)].strip().decode("latin1")
                 if op in (b"cs", b"CS"):
-                    fam = _family(Name(nm), resources)
+                    fam = self._family(nm, res)
                     if op == b"cs":
                         fill = fam
                     else:
                         stroke = fam
-                    init = {"gray": "1", "rgb": "1 1 1", "cmyk": "0 0 0 0",
-                            "tint": " ".join(["0"] * fam[1])}.get(fam[0])
+                    init = {"gray": b"1", "rgb": b"1 1 1", "cmyk": b"0 0 0 0",
+                            "tint": b" ".join([b"0"] * max(fam[1], 1))}.get(fam[0])
                     if init is not None:
-                        out.append(data[last:m.end()])
-                        out.append(f" {init} {'sc' if op == b'cs' else 'SC'}".encode())
-                        last = m.end()
+                        out.append(data[last:mm.end()])
+                        out.append(b" " + init + (b" sc" if op == b"cs" else b" SC"))
+                        last = mm.end()
                 elif op == b"Do":
-                    self._xobject(Name(nm), resources)
+                    self._xobject(nm.lstrip("/"), res)
                 elif op == b"sh":
-                    self._shading_by_name(Name(nm), resources)
-                pos = m.end()
+                    self._shading_named(nm.lstrip("/"), res)
+                pos = mm.end()
                 continue
-            pos = m.end()
+            # 색 연산자 (g G rg RG k K sc SC scn SCN)
+            if not nxt_ok or prev not in WS:
+                pos = en
+                continue
+            op = t.decode()
+            bm = self._BACKNUMS.search(data, max(last, st - 160), st)
+            nums = self._NUM.findall(bm.group(1)) if bm else []
+            need = {"g": 1, "G": 1, "rg": 3, "RG": 3, "k": 4, "K": 4}.get(op)
+            if need is None:  # sc/scn: 현재 색 공간 기준
+                fam = fill if op in ("sc", "scn") else stroke
+                need, fam_name = (fam[1] or len(nums)), fam[0]
+            else:
+                fam_name = {1: "gray", 3: "rgb", 4: "cmyk"}[need]
+                if op.islower():
+                    fill = (fam_name, need)
+                else:
+                    stroke = (fam_name, need)
+            if bm and need and len(nums) >= need:
+                keep, vals = nums[:-need], nums[-need:]
+                new = _invert_color_values(fam_name, vals)
+                if new is not None:
+                    out.append(data[last:bm.start(1)])
+                    out.append(b" ".join(keep + [_fmt(v) for v in new]) + b" " + t)
+                    last = en
+            pos = en
         out.append(data[last:])
         return b"".join(out)
 
-    def _inline_head(self, head: bytes):
-        """인라인 이미지(BI…ID)의 사전에 반전 Decode를 넣는다."""
+    @staticmethod
+    def _inline_head(head: bytes):
+        """인라인 이미지(BI…ID) 사전에 반전 Decode를 넣는다."""
         if re.search(rb"/(IM|ImageMask)\s+true", head) or re.search(rb"/(D|Decode)[\s\[]", head):
             return None
         mcs = re.search(rb"/(?:CS|ColorSpace)\s*/(\w+)", head)
-        cs = mcs.group(1) if mcs else b""
-        n = {b"G": 1, b"DeviceGray": 1, b"RGB": 3, b"DeviceRGB": 3}.get(cs)
+        n = {b"G": 1, b"DeviceGray": 1, b"RGB": 3, b"DeviceRGB": 3}.get(mcs.group(1) if mcs else b"")
         if not n:
             return None
         return head + b" /D [" + b" ".join([b"1 0"] * n) + b"]"
 
-    def process_stream(self, stream: Stream, resources, prefix: bytes = b""):
-        data = stream.read_bytes()
-        stream.write(prefix + self.transform_bytes(data, resources))
-        self.process_resources(resources)
+    def process_stream(self, xref: int, res: Ref | None, prefix: bytes = b""):
+        data = self.doc.xref_stream(xref) or b""
+        self.doc.update_stream(xref, prefix + self.transform_bytes(data, res), compress=0)
+        self.process_resources(res)
 
     # ── 자원 ───────────────────────────────────────────
-    def process_resources(self, res):
-        if res is None or not self._once(res):
+    def process_resources(self, res: Ref | None):
+        if res is None or not self._once(("res",) + res.ident):
             return
-        try:
-            for _, cs in (res.get("/ColorSpace") or {}).items():
-                self._colorspace_obj(cs)
-            for _, pat in (res.get("/Pattern") or {}).items():
-                self._pattern(pat)
-            for _, sh in (res.get("/Shading") or {}).items():
-                self._shading(sh)
-            for _, font in (res.get("/Font") or {}).items():
-                if font.get("/Subtype") == "/Type3" and self._once(font):
-                    fres = font.get("/Resources") or res
-                    for _, proc in (font.get("/CharProcs") or {}).items():
-                        if self._once(proc):
-                            self.process_stream(proc, fres)
-        except Exception:
-            pass
+        for cat, fn in (("ColorSpace", self._colorspace), ("Pattern", self._pattern),
+                        ("Shading", self._shading), ("Font", self._font)):
+            sub = res.child(cat)
+            if sub is None:
+                continue
+            try:
+                for k in sub.keys():
+                    fn(sub, k, res)
+            except Exception:
+                pass
 
-    def _xobject(self, name, resources):
-        try:
-            xo = resources.XObject[str(name)]
-        except Exception:
+    def _font(self, fonts: Ref, key, res):
+        f = fonts.child(key)
+        if f is None or f.get("Subtype")[1] != "/Type3" or not self._once(("font",) + f.ident):
             return
-        if not self._once(xo):
+        fres = f.child("Resources") or res
+        procs = f.child("CharProcs")
+        if procs is None:
             return
-        sub = xo.get("/Subtype")
+        for k in procs.keys():
+            t, v = procs.get(k)
+            if t == "xref":
+                x = int(v.split()[0])
+                if self._once(("x", x)):
+                    self.process_stream(x, fres)
+
+    def _xobject(self, name, res: Ref | None):
+        if res is None:
+            return
+        t, v = res.get(f"XObject/{name}")
+        if t != "xref":
+            return
+        x = int(v.split()[0])
+        if not self._once(("x", x)):
+            return
+        obj = Ref(self.doc, x)
+        sub = obj.get("Subtype")[1]
         if sub == "/Form":
-            self.process_stream(xo, xo.get("/Resources") or resources)
+            self.process_stream(x, obj.child("Resources") or res)
         elif sub == "/Image":
-            self._image(xo, resources)
+            self._image(x, res)
 
-    def _colorspace_obj(self, cs):
+    def _colorspace(self, spaces: Ref, key, res=None):
         """Indexed 색 공간의 팔레트를 뒤집는다."""
-        if not isinstance(cs, Array) or len(cs) < 4 or str(cs[0]) not in ("/Indexed", "/I"):
-            return
-        if not self._once(cs) and cs.objgen != (0, 0):
-            return
-        fam, n = _family(cs[1], None)
-        lut = cs[3]
-        raw = bytes(lut.read_bytes() if isinstance(lut, Stream) else bytes(lut))
-        if fam in ("gray", "rgb"):
-            new = bytes(255 - b for b in raw)
-        elif fam == "cmyk":
-            out = bytearray()
-            for i in range(0, len(raw) - 3, 4):
-                c, m, y, k = (x / 255 for x in raw[i:i + 4])
-                out += bytes(int(round(255 * float(v))) for v in _inv_cmyk(c, m, y, k))
-            new = bytes(out)
-        else:
-            return
-        if isinstance(lut, Stream):
-            lut.write(new)
-        else:
-            cs[3] = pikepdf.String(new)
+        t, v = spaces.get(key)
+        if t == "xref":
+            x = int(v.split()[0])
+            if self._once(("cs", x)):
+                self._indexed(Ref(self.doc, x), self.doc.xref_object(x, compressed=True), whole=True)
+        elif t == "array" and self._once(("cs",) + spaces.ident + (key,)):
+            self._indexed(spaces, v, key=key)
 
-    def _image(self, img: Stream, resources):
-        if img.get("/ImageMask"):
-            return  # 채우기 색으로 칠해지므로 색 명령 반전으로 충분
-        cs = img.get("/ColorSpace")
-        fam, n = _family(cs, resources) if cs is not None else ("other", 0)
-        if fam == "idx":
-            self._colorspace_obj(cs if isinstance(cs, Array) else resources.ColorSpace[str(cs)])
+    def _indexed(self, owner: Ref, text: str, key=None, whole=False):
+        m = re.match(r"\s*\[\s*/(?:Indexed|I)\s*(.+?)\s*(?<=[\]>\s/A-Za-z])(\d+)\s*(<[0-9A-Fa-f\s]*>|\(.*\)|\d+\s+0\s+R)\s*\]\s*$",
+                     text, re.S)
+        if not m:
             return
-        filt = img.get("/Filter")
-        filters = [str(f) for f in (filt if isinstance(filt, Array) else [filt])] if filt is not None else []
-        if fam in ("gray", "rgb", "tint") and "/JPXDecode" not in filters:
-            bpc = int(img.get("/BitsPerComponent", 8))
-            maxv = 1
-            dec = img.get("/Decode")
-            if dec is not None and len(dec) == 2 * n:
-                pairs = [(dec[2 * i], dec[2 * i + 1]) for i in range(n)]
-            else:
-                pairs = [(0, maxv)] * n
-            img.Decode = Array([v for a, b in pairs for v in (b, a)])
+        base, lut = m.group(1).strip(), m.group(3)
+        if re.fullmatch(r"\d+\s+0\s+R", base):
+            fam = _family_text("xref", base, self.doc)[0]
+        else:
+            fam = _family_text("obj", base, self.doc)[0]
+        if fam not in ("gray", "rgb", "cmyk"):
+            return
+        if lut.endswith("R"):
+            lx = int(lut.split()[0])
+            raw = self.doc.xref_stream(lx) or b""
+        elif lut.startswith("<"):
+            raw = bytes.fromhex(re.sub(r"\s", "", lut[1:-1]))
+        else:
+            raw = _pdf_literal_bytes(lut)
+        if fam == "cmyk":
+            new = bytearray()
+            for i in range(0, len(raw) - 3, 4):
+                vals = _inv_cmyk(*(b / 255 for b in raw[i:i + 4]))
+                new += bytes(int(round(255 * v)) for v in vals)
+            new = bytes(new)
+        else:
+            new = bytes(255 - b for b in raw)
+        if lut.endswith("R"):
+            self.doc.update_stream(lx, new)
+            return
+        newtext = text[:m.start(3)] + "<" + new.hex() + ">" + text[m.end(3):]
+        if whole:
+            self.doc.update_object(owner.xref, newtext)
+        else:
+            owner.set(key, newtext)
+
+    def _image(self, x: int, res: Ref | None):
+        img = Ref(self.doc, x)
+        if img.get("ImageMask")[1] == "true":
+            return  # 채우기 색으로 칠해지므로 색 명령 반전으로 충분
+        t, v = img.get("ColorSpace")
+        if t == "null":
+            return
+        if t == "name":
+            fam = self._family(v, res)
+            cs_text = v
+            if res is not None and fam[0] == "idx":
+                rt, rv = res.get(f"ColorSpace/{v.lstrip('/')}")
+                if rt == "xref":
+                    t, v = rt, rv
+                cs_text = rv
+        else:
+            fam = _family_text(t, v, self.doc)
+            cs_text = self.doc.xref_object(int(v.split()[0]), compressed=True) if t == "xref" else v
+        if fam[0] == "idx":
+            if t == "xref":
+                xx = int(v.split()[0])
+                if self._once(("cs", xx)):
+                    self._indexed(Ref(self.doc, xx), cs_text, whole=True)
+            elif t == "array" and self._once(("cs", x, "ColorSpace")):
+                self._indexed(img, cs_text, key="ColorSpace")
+            return
+        filt = img.get("Filter")[1] or ""
+        if fam[0] in ("gray", "rgb", "tint") and "JPX" not in filt:
+            n = max(fam[1], 1)
+            dt, dv = img.get("Decode")
+            nums = re.findall(r"[-+]?\d*\.?\d+", dv) if dt == "array" else []
+            pairs = [(nums[2 * i], nums[2 * i + 1]) for i in range(n)] if len(nums) == 2 * n else [("0", "1")] * n
+            img.set("Decode", "[" + " ".join(f"{b} {a}" for a, b in pairs) + "]")
             return
         # CMYK·JPX 등은 실제 픽셀을 RGB로 바꿔 반전
         try:
-            from PIL import ImageOps
-            pil = pikepdf.PdfImage(img).as_pil_image().convert("RGB")
-            pil = ImageOps.invert(pil)
-            buf = io.BytesIO()
-            pil.save(buf, format="JPEG", quality=92)
-            img.write(buf.getvalue(), filter=Name.DCTDecode)
-            img.ColorSpace = Name.DeviceRGB
-            img.BitsPerComponent = 8
-            for k in ("/Decode", "/DecodeParms"):
-                if k in img:
-                    del img[k]
-        except Exception:
-            pass
-
-    def _inline_image(self, ii):
-        try:
-            d = ii.obj
-            if d.get("/IM") or d.get("/ImageMask"):
-                return
-            cs = d.get("/CS", d.get("/ColorSpace"))
-            fam, n = _family(cs, None) if cs is not None else ("other", 0)
-            if fam in ("gray", "rgb"):
-                d.D = Array([1, 0] * n)
+            pix = pymupdf.Pixmap(self.doc, x)
+            if pix.alpha:
+                pix = pymupdf.Pixmap(pix, 0)
+            if pix.colorspace is None or pix.colorspace.n != 3:
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            pix.invert_irect(pix.irect)
+            self.doc.update_stream(x, pix.tobytes("jpeg", jpg_quality=92), compress=0)
+            for k, val in (("Filter", "/DCTDecode"), ("ColorSpace", "/DeviceRGB"),
+                           ("BitsPerComponent", "8"), ("Width", str(pix.width)),
+                           ("Height", str(pix.height)), ("Decode", "null"), ("DecodeParms", "null")):
+                self.doc.xref_set_key(x, k, val)
         except Exception:
             pass
 
     # ── 패턴·그라데이션 ─────────────────────────────────
-    def _pattern(self, pat):
-        if not self._once(pat):
+    def _pattern(self, pats: Ref, key, res):
+        p = pats.child(key)
+        if p is None or not self._once(("pat",) + p.ident):
             return
-        if int(pat.get("/PatternType", 0)) == 1 and isinstance(pat, Stream):
-            self.process_stream(pat, pat.get("/Resources"))
-        elif "/Shading" in pat:
-            self._shading(pat.Shading)
+        if p.get("PatternType")[1] == "1" and not p.path:
+            if self._once(("x", p.xref)):
+                self.process_stream(p.xref, p.child("Resources") or res)
+        else:
+            sh = p.child("Shading")
+            if sh is not None:
+                self._shading_ref(sh)
 
-    def _shading_by_name(self, name, resources):
-        try:
-            self._shading(resources.Shading[str(name)])
-        except Exception:
-            pass
+    def _shading(self, shs: Ref, key, res=None):
+        sh = shs.child(key)
+        if sh is not None:
+            self._shading_ref(sh)
 
-    def _shading(self, sh):
-        if not self._once(sh):
+    def _shading_named(self, name, res):
+        if res is not None:
+            sh = res.child(f"Shading/{name}")
+            if sh is not None:
+                self._shading_ref(sh)
+
+    def _shading_ref(self, sh: Ref):
+        if not self._once(("sh",) + sh.ident):
             return
-        fam, n = _family(sh.get("/ColorSpace"), None)
+        t, v = sh.get("ColorSpace")
+        fam = _family_text(t, v, self.doc)[0]
         if fam not in ("gray", "rgb", "cmyk", "tint"):
             return
-        if "/Function" in sh:
-            fns = sh.Function if isinstance(sh.Function, Array) else [sh.Function]
-            for f in fns:
+        t, v = sh.get("Function")
+        if t == "array":
+            for mm in re.finditer(r"(\d+)\s+0\s+R", v):
+                self._function(Ref(self.doc, int(mm.group(1))), fam)
+        else:
+            f = sh.child("Function")
+            if f is not None:
                 self._function(f, fam)
 
-    def _function(self, f, fam):
+    def _function(self, f: Ref, fam):
+        if not self._once(("fn",) + f.ident):
+            return
         try:
-            t = int(f.FunctionType)
-            if t == 2:
-                for key in ("/C0", "/C1"):
-                    vals = f.get(key) or ([0] * 1 if key == "/C0" else [1])
-                    new = _invert_color_values(fam, list(vals))
+            ftype = f.get("FunctionType")[1]
+            if ftype == "2":
+                for key, default in (("C0", ["0"]), ("C1", ["1"])):
+                    t, v = f.get(key)
+                    vals = re.findall(r"[-+]?\d*\.?\d+", v) if t == "array" else default
+                    new = _invert_color_values(fam, vals)
                     if new is not None:
-                        f[key] = Array(new)
-            elif t == 3:
-                for g in f.Functions:
-                    self._function(g, fam)
+                        f.set(key, "[" + " ".join(_fmt(x).decode() for x in new) + "]")
+            elif ftype == "3":
+                t, v = f.get("Functions")
+                for mm in re.finditer(r"(\d+)\s+0\s+R", v):
+                    self._function(Ref(self.doc, int(mm.group(1))), fam)
         except Exception:
             pass
 
 
-def invert_vector_recolor(src_bytes: bytes) -> bytes:
-    pdf = pikepdf.open(io.BytesIO(src_bytes))
-    rc = Recolor(pdf)
-    for page in pdf.pages:
-        res = page.obj.get("/Resources")
-        if res is None:
-            par = page.obj.get("/Parent")
-            while par is not None and res is None:
-                res = par.get("/Resources")
-                par = par.get("/Parent")
-            if res is not None:
-                page.obj.Resources = res
-        box = page.obj.get("/CropBox") or page.obj.get("/MediaBox")
-        x0, y0, x1, y1 = (float(v) for v in box)
-        prefix = (f"q 0 g {x0:.2f} {y0:.2f} {x1 - x0:.2f} {y1 - y0:.2f} re f Q\n"
-                  "1 g 1 G\n").encode()
-        if "/Contents" in page.obj:
-            page.contents_coalesce()
-            rc.process_stream(page.obj.Contents, res, prefix)
+def _pdf_literal_bytes(s: str) -> bytes:
+    """PDF 리터럴 문자열 '( ... )' → 바이트."""
+    body = s[1:-1]
+    out = bytearray()
+    i = 0
+    esc = {"n": 10, "r": 13, "t": 9, "b": 8, "f": 12, "(": 40, ")": 41, "\\": 92}
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            d = body[i + 1]
+            if d in esc:
+                out.append(esc[d])
+                i += 2
+                continue
+            m = re.match(r"[0-7]{1,3}", body[i + 1:])
+            if m:
+                out.append(int(m.group(), 8) & 255)
+                i += 1 + m.end()
+                continue
+            i += 2
+            continue
+        out.append(ord(c) & 255)
+        i += 1
+    return bytes(out)
+
+
+def invert_document(doc: pymupdf.Document, on_page=None, should_stop=None) -> None:
+    """열린 문서를 제자리에서 반전한다."""
+    rc = Recolor(doc)
+    n = doc.page_count
+    for i, page in enumerate(doc):
+        if should_stop and should_stop():
+            raise InterruptedError
+        t, v = doc.xref_get_key(page.xref, "Resources")
+        if t == "null":  # 상속된 Resources를 페이지에 직접 붙임
+            par = doc.xref_get_key(page.xref, "Parent")
+            while par[0] == "xref" and t == "null":
+                px = int(par[1].split()[0])
+                t, v = doc.xref_get_key(px, "Resources")
+                par = doc.xref_get_key(px, "Parent")
+            if t != "null":
+                doc.xref_set_key(page.xref, "Resources", v)
+        res = Ref(doc, page.xref).child("Resources")
+        box, mb = page.cropbox, page.mediabox
+        x0, y0 = box.x0, mb.height - box.y1  # cropbox(위가 원점) → PDF 좌표(아래가 원점)
+        prefix = (f"q 0 g {x0:.2f} {y0:.2f} {box.width:.2f} {box.height:.2f} re f Q\n1 g 1 G\n").encode()
+        conts = page.get_contents()
+        if conts:
+            data = b"\n".join((doc.xref_stream(c) or b"") for c in conts)
+            first = conts[0]
+            if len(conts) > 1:
+                doc.update_stream(first, data, compress=0)
+                doc.xref_set_key(page.xref, "Contents", f"{first} 0 R")
+            if ("x", first) not in rc.done:  # 여러 페이지가 같은 내용을 공유하면 한 번만
+                rc.done.add(("x", first))
+                rc.process_stream(first, res, prefix)
         else:
-            page.obj.Contents = pdf.make_stream(prefix)
-        if "/Group" in page.obj:  # 투명도 그룹 배경이 흰색으로 그려지는 것을 방지할 필요는 없음
-            pass
-    out = io.BytesIO()
-    pdf.save(out, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-    return out.getvalue()
+            x = doc.get_new_xref()
+            doc.update_object(x, "<<>>")
+            doc.update_stream(x, prefix)
+            doc.xref_set_key(page.xref, "Contents", f"{x} 0 R")
+        if on_page:
+            on_page(i + 1, n)

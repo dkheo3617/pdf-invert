@@ -134,25 +134,15 @@ def _save(doc: pymupdf.Document, dst: Path) -> None:
 def _invert_vector(src, dst, on_page, should_stop) -> None:
     """빠른 변환: PDF 안의 색 명령·이미지를 직접 뒤집고 검은 바탕을 깐다.
     다시 그리지 않으므로 매우 빠르고, 글자·도형이 벡터 그대로 남는다."""
-    from recolor import invert_vector_recolor
-    with pymupdf.open(src) as d:
-        n = d.page_count
-        has_annots = any(True for p in d for _ in p.annots()) or any(True for p in d for _ in p.widgets())
-        if has_annots:
-            d.bake()  # 주석·필기를 본문으로 합쳐 함께 반전되게
-            data = d.tobytes()
-        else:
-            data = None
-    if should_stop and should_stop():
-        raise InterruptedError
-    if data is None:
-        data = Path(src).read_bytes()
-    out = invert_vector_recolor(data)
-    if on_page:
-        on_page(n, n)
-    tmp = dst.with_name(dst.name + ".tmp")
-    tmp.write_bytes(out)
-    os.replace(tmp, dst)
+    from recolor import invert_document
+    doc = pymupdf.open(src)
+    try:
+        if any(True for p in doc for _ in p.annots()) or any(True for p in doc for _ in p.widgets()):
+            doc.bake()  # 주석·필기를 본문으로 합쳐 함께 반전되게
+        invert_document(doc, on_page, should_stop)
+        _save(doc, dst)
+    finally:
+        doc.close()
 
 
 def _render_page(args):
