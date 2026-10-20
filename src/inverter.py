@@ -25,39 +25,80 @@ PARALLEL_MIN_PAGES = 4
 class Job:
     src: Path
     dst: Path
+    dst_exists: bool = False
 
 
 def output_path(src: Path) -> Path:
     return src.with_name(f"{PREFIX}{src.stem}.pdf")
 
 
+def _is_target_name(name: str) -> bool:
+    return name.lower().endswith(".pdf") and not name.startswith(PREFIX) and not name.startswith(".")
+
+
 def is_target(p: Path) -> bool:
-    return (
-        p.is_file()
-        and p.suffix.lower() == ".pdf"
-        and not p.name.startswith(PREFIX)
-        and not p.name.startswith("._")
-    )
+    return _is_target_name(p.name) and p.is_file()
 
 
-def collect_jobs(paths: Iterable[str | os.PathLike], recursive: bool = True) -> list[Job]:
+SKIP_DIR_SUFFIXES = (".app", ".photoslibrary", ".bundle", ".framework")
+
+
+def _scan_dir(root: str, recursive: bool, should_stop):
+    """폴더 하나를 빠르게 훑는다: 파일 이름으로 먼저 거르고(디스크 조회 최소화),
+    같은 폴더의 이름 목록으로 [반전] 파일 존재 여부도 함께 판단한다."""
+    stack = [root]
+    while stack:
+        if should_stop and should_stop():
+            raise InterruptedError
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        names = {e.name for e in entries}
+        pdfs, subdirs = [], []
+        for e in entries:
+            n = e.name
+            if _is_target_name(n):
+                try:
+                    if e.is_file():
+                        pdfs.append(n)
+                except OSError:
+                    pass
+            elif recursive and not n.startswith(".") and not n.lower().endswith(SKIP_DIR_SUFFIXES):
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        subdirs.append(e.path)
+                except OSError:
+                    pass
+        for n in sorted(pdfs):
+            src = Path(d, n)
+            yield Job(src, output_path(src), f"{PREFIX}{Path(n).stem}.pdf" in names)
+        stack.extend(sorted(subdirs, reverse=True))
+
+
+def collect_jobs(paths: Iterable[str | os.PathLike], recursive: bool = True,
+                 on_found: Callable[[int], None] | None = None,
+                 should_stop: Callable[[], bool] | None = None) -> list[Job]:
     """파일·폴더 목록을 받아 반전할 PDF 작업 목록을 만든다 (중복 제거)."""
-    seen: set[Path] = set()
+    seen: set[str] = set()
     jobs: list[Job] = []
     for raw in paths:
         p = Path(raw)
         if p.is_dir():
-            it = p.rglob("*") if recursive else p.iterdir()
-            files = sorted(f for f in it if is_target(f))
+            found = _scan_dir(str(p), recursive, should_stop)
         elif is_target(p):
-            files = [p]
+            found = [Job(p, output_path(p), output_path(p).exists())]
         else:
-            files = []
-        for f in files:
-            key = f.resolve()
+            found = []
+        for job in found:
+            key = os.path.normcase(os.path.abspath(job.src))
             if key not in seen:
                 seen.add(key)
-                jobs.append(Job(f, output_path(f)))
+                jobs.append(job)
+                if on_found and len(jobs) % 20 == 0:
+                    on_found(len(jobs))
     return jobs
 
 

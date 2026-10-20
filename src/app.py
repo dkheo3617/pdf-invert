@@ -15,10 +15,10 @@ from PySide6.QtWidgets import (
 )
 
 import updater
-from inverter import QUALITY_PRESETS, Job, collect_jobs, invert_pdf, page_count
+from inverter import QUALITY_PRESETS, Job, collect_jobs, invert_pdf
 
 APP_NAME = "PDF 색상반전"
-VERSION = "2.2.2"
+VERSION = "2.2.3"
 
 
 def resource(name: str) -> str:
@@ -40,21 +40,18 @@ class Worker(QObject):
         self._stop = True
 
     def run(self):
-        totals = []
-        for j in self.jobs:
-            try:
-                totals.append(page_count(j.src))
-            except Exception:
-                totals.append(1)
-        total, done, ok, fail = sum(totals) or 1, 0, 0, 0
+        # 페이지 수를 미리 세지 않고(파일을 두 번 여는 시간 절약) 바로 시작한다.
+        unit = 1000
+        total = max(1, len(self.jobs)) * unit
+        ok = fail = 0
         for idx, job in enumerate(self.jobs):
             if self._stop:
                 break
             self.file_started.emit(idx, job.src.name)
-            base = done
+            base = idx * unit
             try:
                 invert_pdf(job.src, job.dst, self.dpi,
-                           on_page=lambda i, n, b=base: self.progress.emit(b + i, total),
+                           on_page=lambda i, n, b=base: self.progress.emit(b + i * unit // max(n, 1), total),
                            should_stop=lambda: self._stop)
                 ok += 1
                 self.file_done.emit(idx, str(job.dst), "")
@@ -64,8 +61,7 @@ class Worker(QObject):
             except Exception as e:  # noqa: BLE001
                 fail += 1
                 self.file_done.emit(idx, "", str(e) or e.__class__.__name__)
-            done = base + totals[idx]
-            self.progress.emit(done, total)
+            self.progress.emit(base + unit, total)
         self.finished.emit(ok, fail)
 
 
@@ -351,7 +347,7 @@ class MainWindow(QWidget):
             self.start([d])
 
     def busy(self) -> bool:
-        return self.thread is not None
+        return self.thread is not None or getattr(self, "scanning", False)
 
     # ── 실행 ──────────────────────────────────────────
     def start(self, paths: list[str]):
@@ -360,16 +356,53 @@ class MainWindow(QWidget):
             return
         first = Path(paths[0])
         self.settings.setValue("last_dir", str(first if first.is_dir() else first.parent))
-        jobs = collect_jobs(paths, self.recursive.isChecked())
+        recursive = self.recursive.isChecked()
+        if len(paths) == 1 and not first.is_dir():  # 파일 하나는 바로 시작
+            self._jobs_ready(collect_jobs(paths, recursive))
+            return
+        # 폴더는 백그라운드에서 훑어 창이 멈추지 않게
+        self.scanning = True
+        self.set_busy(True)
+        self.log.clear()
+        self.status.setText("PDF 파일을 찾는 중…")
+        self.bar.setRange(0, 0)  # 움직이는 진행 막대
+
+        def work(task):
+            return collect_jobs(paths, recursive,
+                                on_found=lambda n: task.progress.emit(n, 0),
+                                should_stop=lambda: task.stop_flag)
+
+        def found(n, _):
+            self.status.setText(f"PDF 파일을 찾는 중… {n}개")
+
+        def done(jobs):
+            self._end_scan()
+            self._jobs_ready(jobs)
+
+        def fail(msg):
+            self._end_scan()
+            self.status.setText("취소됨" if msg == "취소됨" else f"폴더를 읽지 못했습니다: {msg}")
+
+        self.scan_task = run_task(self, work, done, fail, found)
+
+    def _end_scan(self):
+        self.scanning = False
+        self.scan_task = None
+        self.bar.setRange(0, 100); self.bar.setValue(0)
+        self.set_busy(False)
+
+    def _jobs_ready(self, jobs):
         if not jobs:
+            self.status.setText("대기 중")
             QMessageBox.information(self, APP_NAME, "반전할 PDF가 없습니다.\n(이미 [반전]으로 시작하는 파일은 건너뜁니다.)")
             return
         if len(jobs) > 1:
-            existing = sum(j.dst.exists() for j in jobs)
+            existing = sum(j.dst_exists for j in jobs)
             msg = f"PDF {len(jobs)}개를 반전합니다."
             if existing:
                 msg += f"\n이미 [반전] 파일이 있는 {existing}개는 새로 덮어씁니다."
             if QMessageBox.question(self, APP_NAME, msg + "\n계속할까요?") != QMessageBox.Yes:
+                self.status.setText("대기 중")
                 return
         self.log.clear()
         self.items = []
@@ -397,6 +430,10 @@ class MainWindow(QWidget):
         self.drop.setEnabled(not on)
 
     def cancel(self):
+        if getattr(self, "scan_task", None):
+            self.scan_task.stop_flag = True
+            self.status.setText("취소하는 중…")
+            return
         if self.worker:
             self.worker.stop()
             self.status.setText("취소하는 중…")
