@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from inverter import QUALITY_PRESETS, Job, collect_jobs, invert_pdf, page_count
 
 APP_NAME = "PDF 색상반전"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 
 def resource(name: str) -> str:
@@ -156,9 +156,13 @@ class MainWindow(QWidget):
         self.btn_files = QPushButton("파일 선택…"); self.btn_files.clicked.connect(self.pick_files)
         self.btn_dir = QPushButton("폴더 선택…"); self.btn_dir.clicked.connect(self.pick_dir)
         row.addWidget(self.btn_files); row.addWidget(self.btn_dir); row.addStretch()
-        row.addWidget(QLabel("화질"))
+        row.addWidget(QLabel("변환 방식"))
         self.quality = QComboBox(); self.quality.addItems(list(QUALITY_PRESETS))
-        self.quality.setCurrentText(self.settings.value("quality", "고화질 (300dpi)"))
+        saved = self.settings.value("quality", "")
+        if saved in QUALITY_PRESETS:
+            self.quality.setCurrentText(saved)
+        self.quality.setToolTip("빠른 변환: 몇 초 안에 끝나고 글자가 선명하며 용량도 작습니다.\n"
+                                "보기 앱에서 하얗게만 보이면 이미지 변환을 선택하세요.")
         self.quality.currentTextChanged.connect(lambda t: self.settings.setValue("quality", t))
         row.addWidget(self.quality)
         root.addLayout(row)
@@ -313,6 +317,8 @@ class App(QApplication):
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
     app = App(sys.argv)
     app.setApplicationName(APP_NAME)
     icon = resource("icon.png")
