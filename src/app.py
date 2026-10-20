@@ -18,7 +18,7 @@ import updater
 from inverter import QUALITY_PRESETS, Job, collect_jobs, invert_pdf
 
 APP_NAME = "PDF 색상반전"
-VERSION = "2.2.3"
+VERSION = "2.3.0"
 
 
 def resource(name: str) -> str:

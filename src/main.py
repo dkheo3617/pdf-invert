@@ -45,6 +45,7 @@ def selftest() -> int:
     for i in range(5):
         p = d.new_page()
         p.insert_text((72, 72), f"page {i + 1}", fontsize=20)
+        p.draw_line((100, 300), (400, 300), color=(1, 1, 1), width=0.3)  # 흰 바탕의 흰 가는 선
     d.save(src)
     for dpi in (0, 72):
         out = tmp / f"o{dpi}.pdf"
@@ -53,6 +54,8 @@ def selftest() -> int:
             assert o.page_count == 5
             pix = o[0].get_pixmap(dpi=20)
             assert pix.pixel(2, 2)[0] < 30, "반전되지 않음"
+            line = o[0].get_pixmap(dpi=144, clip=pymupdf.Rect(100, 296, 400, 304))
+            assert max(line.samples) < 60, "숨은 흰 선이 드러남"
     print("SELFTEST OK")
     return 0
 

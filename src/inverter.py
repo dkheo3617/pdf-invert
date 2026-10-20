@@ -132,45 +132,27 @@ def _save(doc: pymupdf.Document, dst: Path) -> None:
 
 
 def _invert_vector(src, dst, on_page, should_stop) -> None:
-    """원본 페이지 위에 '차이(Difference)' 혼합 모드의 흰 사각형을 덮어 색을 뒤집는다.
-    다시 그리지 않으므로 매우 빠르고, 글자·도형이 벡터 그대로 남아 확대해도 선명하다."""
-    s = pymupdf.open(src)
-    out = pymupdf.open()
-    try:
-        try:
-            s.bake()  # 주석·필기를 본문으로 합쳐 함께 반전되게
-        except Exception:
-            pass
-        gs = out.get_new_xref()
-        out.update_object(gs, "<</Type/ExtGState/BM/Difference/ca 1/CA 1>>")
-        n = s.page_count
-        for i, page in enumerate(s):
-            if should_stop and should_stop():
-                raise InterruptedError
-            rot = page.rotation
-            if rot:
-                page.set_rotation(0)  # 회전은 결과 페이지에 그대로 다시 적용
-            w, h = page.rect.width, page.rect.height
-            new = out.new_page(width=w, height=h)
-            new.draw_rect(new.rect, color=None, fill=(1, 1, 1), width=0)  # 투명 바탕 → 흰 바탕
-            new.show_pdf_page(new.rect, s, i)
-            new.clean_contents()
-            cx = new.get_contents()[0]
-            out.update_stream(cx, new.read_contents()
-                              + f"\nq /InvGS gs 1 1 1 rg 0 0 {w:.3f} {h:.3f} re f Q\n".encode())
-            t, v = out.xref_get_key(new.xref, "Resources")
-            if t == "xref":
-                out.xref_set_key(int(v.split()[0]), "ExtGState/InvGS", f"{gs} 0 R")
-            else:
-                out.xref_set_key(new.xref, "Resources/ExtGState/InvGS", f"{gs} 0 R")
-            if rot:
-                new.set_rotation(rot)
-            if on_page:
-                on_page(i + 1, n)
-        _save(out, dst)
-    finally:
-        out.close()
-        s.close()
+    """빠른 변환: PDF 안의 색 명령·이미지를 직접 뒤집고 검은 바탕을 깐다.
+    다시 그리지 않으므로 매우 빠르고, 글자·도형이 벡터 그대로 남는다."""
+    from recolor import invert_vector_recolor
+    with pymupdf.open(src) as d:
+        n = d.page_count
+        has_annots = any(True for p in d for _ in p.annots()) or any(True for p in d for _ in p.widgets())
+        if has_annots:
+            d.bake()  # 주석·필기를 본문으로 합쳐 함께 반전되게
+            data = d.tobytes()
+        else:
+            data = None
+    if should_stop and should_stop():
+        raise InterruptedError
+    if data is None:
+        data = Path(src).read_bytes()
+    out = invert_vector_recolor(data)
+    if on_page:
+        on_page(n, n)
+    tmp = dst.with_name(dst.name + ".tmp")
+    tmp.write_bytes(out)
+    os.replace(tmp, dst)
 
 
 def _render_page(args):
