@@ -1,4 +1,4 @@
-pymupdf>=1.24
+pymupdf>=1.26,<2  # 2.x는 레이아웃 AI 모델(51MB)이 포함돼 앱이 커짐
 PySide6-Essentials>=6.7
 pyinstaller>=6.10
 pillow>=10

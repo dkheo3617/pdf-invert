@@ -5,7 +5,7 @@ from PyInstaller.utils.hooks import collect_all
 
 APP = "PDFInvert"
 DISPLAY = "PDF색상반전"
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 # PyMuPDF의 데이터 파일(레이아웃 모델 등)까지 빠짐없이 포함
 mu_datas, mu_bins, mu_hidden = collect_all("pymupdf")
